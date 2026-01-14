@@ -1,0 +1,10 @@
+version: '3'
+services:
+  pplx2api:
+    image: ghcr.io/yushangxiao/pplx2api:latest
+    container_name: pplx
+    ports:
+      - "${PORT:-8181}:8080"
+    env_file:
+      - .env
+    restart: unless-stopped
