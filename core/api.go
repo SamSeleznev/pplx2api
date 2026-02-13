@@ -234,7 +234,7 @@ func (c *Client) SendMessage(message string, stream bool, is_incognito bool, gc 
 
 func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context) error {
 	defer body.Close()
-	// Set headers for streaming
+
 	if stream {
 		gc.Writer.Header().Set("Content-Type", "text/event-stream")
 		gc.Writer.Header().Set("Cache-Control", "no-cache")
@@ -242,14 +242,18 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 		gc.Writer.WriteHeader(http.StatusOK)
 		gc.Writer.Flush()
 	}
+
 	scanner := bufio.NewScanner(body)
-	clientDone := gc.Request.Context().Done()
-	// 增大缓冲区大小
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	full_text := ""
+	clientDone := gc.Request.Context().Done()
+
+	var fullText strings.Builder
+	responseModel := config.ModelReverseMapGet(c.Model, c.Model)
+	lastReasoningText := ""
+	lastMarkdownText := ""
 	inThinking := false
 	thinkShown := false
-	final := false
+
 	for scanner.Scan() {
 		select {
 		case <-clientDone:
@@ -259,114 +263,115 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 		}
 
 		line := scanner.Text()
-		// Skip empty lines
-		if line == "" {
+		if line == "" || !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		if !strings.HasPrefix(line, "data: ") {
+
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" {
 			continue
 		}
-		data := line[6:]
-		// logger.Info(fmt.Sprintf("Received data: %s", data))
+		if data == "[DONE]" {
+			break
+		}
+
 		var response PerplexityResponse
 		if err := json.Unmarshal([]byte(data), &response); err != nil {
 			logger.Error(fmt.Sprintf("Error parsing JSON: %v", err))
 			continue
 		}
-		// Check for completion and web results
-		if response.Status == "COMPLETED" {
-			final = true
-			for _, block := range response.Blocks {
-				if block.ImageModeBlock != nil && block.ImageModeBlock.Progress == "DONE" && len(block.ImageModeBlock.MediaItems) > 0 {
-					imageResultsText := ""
-					imageModelList := []string{}
-					for i, result := range block.ImageModeBlock.MediaItems {
-						imageResultsText += utils.ImageShow(i, result.Name, result.Image)
-						imageModelList = append(imageModelList, result.Name)
 
-					}
-					if len(imageModelList) > 0 {
-						imageResultsText = imageResultsText + "\n\n---\n" + strings.Join(imageModelList, ", ")
-					}
-					full_text += imageResultsText
+		if response.DisplayModel != "" {
+			responseModel = config.ModelReverseMapGet(response.DisplayModel, response.DisplayModel)
+		}
 
-					if stream {
-						model.ReturnOpenAIResponse(imageResultsText, stream, gc)
-					}
-				}
+		reasoningText := extractReasoningText(response.Blocks)
+		reasoningDelta := extractDelta(lastReasoningText, reasoningText)
+		if reasoningDelta != "" {
+			resText := reasoningDelta
+			if !inThinking && !thinkShown {
+				resText = "<think>" + resText
+				inThinking = true
 			}
-			for _, block := range response.Blocks {
-				if !config.ConfigInstance.IgnoreSerchResult && block.WebResultBlock != nil && len(block.WebResultBlock.WebResults) > 0 {
-					webResultsText := "\n\n---\n"
-					for i, result := range block.WebResultBlock.WebResults {
-						webResultsText += "\n\n" + utils.SearchShow(i, result.Name, result.URL, result.Snippet)
-					}
-					full_text += webResultsText
-
-					if stream {
-						model.ReturnOpenAIResponse(webResultsText, stream, gc)
-					}
+			fullText.WriteString(resText)
+			if stream {
+				if err := model.ReturnOpenAIResponse(resText, stream, responseModel, gc); err != nil {
+					return err
 				}
-
-			}
-
-			if !config.ConfigInstance.IgnoreModelMonitoring && response.DisplayModel != c.Model {
-				res_text := "\n\n---\n"
-				res_text += fmt.Sprintf("Display Model: %s\n", config.ModelReverseMapGet(response.DisplayModel, response.DisplayModel))
-				full_text += res_text
-				if !stream {
-					break
-				}
-				model.ReturnOpenAIResponse(res_text, stream, gc)
 			}
 		}
-		if final {
+		if reasoningText != "" {
+			lastReasoningText = reasoningText
+		}
+
+		markdownText := extractMarkdownText(response.Blocks)
+		markdownDelta := extractDelta(lastMarkdownText, markdownText)
+		if markdownDelta != "" {
+			resText := markdownDelta
+			if inThinking {
+				resText = "</think>\n\n" + resText
+				inThinking = false
+				thinkShown = true
+			}
+			fullText.WriteString(resText)
+			if stream {
+				if err := model.ReturnOpenAIResponse(resText, stream, responseModel, gc); err != nil {
+					return err
+				}
+			}
+		}
+		if markdownText != "" {
+			lastMarkdownText = markdownText
+		}
+
+		if response.Status == "COMPLETED" {
+			if inThinking {
+				closingThink := "</think>"
+				inThinking = false
+				thinkShown = true
+				fullText.WriteString(closingThink)
+				if stream {
+					if err := model.ReturnOpenAIResponse(closingThink, stream, responseModel, gc); err != nil {
+						return err
+					}
+				}
+			}
+
+			imageResultsText := buildImageResultsText(response.Blocks)
+			if imageResultsText != "" {
+				fullText.WriteString(imageResultsText)
+				if stream {
+					if err := model.ReturnOpenAIResponse(imageResultsText, stream, responseModel, gc); err != nil {
+						return err
+					}
+				}
+			}
+
+			if !config.ConfigInstance.IgnoreSerchResult {
+				webResultsText := buildWebResultsText(response.Blocks)
+				if webResultsText != "" {
+					fullText.WriteString(webResultsText)
+					if stream {
+						if err := model.ReturnOpenAIResponse(webResultsText, stream, responseModel, gc); err != nil {
+							return err
+						}
+					}
+				}
+			}
+
+			if !config.ConfigInstance.IgnoreModelMonitoring && response.DisplayModel != "" && response.DisplayModel != c.Model {
+				monitorText := "\n\n---\n"
+				monitorText += fmt.Sprintf("Display Model: %s\n", config.ModelReverseMapGet(response.DisplayModel, response.DisplayModel))
+				fullText.WriteString(monitorText)
+				if stream {
+					if err := model.ReturnOpenAIResponse(monitorText, stream, responseModel, gc); err != nil {
+						return err
+					}
+				}
+			}
+
 			break
 		}
-		// Process each block in the response
-		for _, block := range response.Blocks {
-			// Handle reasoning plan blocks (thinking)
-			if block.ReasoningPlanBlock != nil && len(block.ReasoningPlanBlock.Goals) > 0 {
-
-				res_text := ""
-				if !inThinking && !thinkShown {
-					res_text += "<think>"
-					inThinking = true
-				}
-
-				for _, goal := range block.ReasoningPlanBlock.Goals {
-					if goal.Description != "" && goal.Description != "Beginning analysis" && goal.Description != "Wrapping up analysis" {
-						res_text += goal.Description
-					}
-				}
-				full_text += res_text
-				if !stream {
-					continue
-				}
-				model.ReturnOpenAIResponse(res_text, stream, gc)
-			}
-		}
-		for _, block := range response.Blocks {
-			if block.MarkdownBlock != nil && len(block.MarkdownBlock.Chunks) > 0 {
-				res_text := ""
-				if inThinking {
-					res_text += "</think>\n\n"
-					inThinking = false
-					thinkShown = true
-				}
-				for _, chunk := range block.MarkdownBlock.Chunks {
-					if chunk != "" {
-						res_text += chunk
-					}
-				}
-				full_text += res_text
-				if !stream {
-					continue
-				}
-				model.ReturnOpenAIResponse(res_text, stream, gc)
-			}
-		}
-
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -374,14 +379,109 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	}
 
 	if !stream {
-		model.ReturnOpenAIResponse(full_text, stream, gc)
-	} else {
-		// Send end marker for streaming mode
-		gc.Writer.Write([]byte("data: [DONE]\n\n"))
-		gc.Writer.Flush()
+		return model.ReturnOpenAIResponse(fullText.String(), stream, responseModel, gc)
 	}
 
+	gc.Writer.Write([]byte("data: [DONE]\n\n"))
+	gc.Writer.Flush()
 	return nil
+}
+
+func extractReasoningText(blocks []Block) string {
+	var builder strings.Builder
+	for _, block := range blocks {
+		if block.ReasoningPlanBlock == nil || len(block.ReasoningPlanBlock.Goals) == 0 {
+			continue
+		}
+		for _, goal := range block.ReasoningPlanBlock.Goals {
+			if goal.Description == "" || goal.Description == "Beginning analysis" || goal.Description == "Wrapping up analysis" {
+				continue
+			}
+			builder.WriteString(goal.Description)
+		}
+	}
+	return builder.String()
+}
+
+func extractMarkdownText(blocks []Block) string {
+	var builder strings.Builder
+	for _, block := range blocks {
+		if block.MarkdownBlock == nil || len(block.MarkdownBlock.Chunks) == 0 {
+			continue
+		}
+		for _, chunk := range block.MarkdownBlock.Chunks {
+			if chunk == "" {
+				continue
+			}
+			builder.WriteString(chunk)
+		}
+	}
+	return builder.String()
+}
+
+func extractDelta(previous string, current string) string {
+	if current == "" {
+		return ""
+	}
+	if previous == "" {
+		return current
+	}
+	if strings.HasPrefix(current, previous) {
+		return current[len(previous):]
+	}
+	if strings.HasPrefix(previous, current) {
+		return ""
+	}
+
+	maxOverlap := len(previous)
+	if len(current) < maxOverlap {
+		maxOverlap = len(current)
+	}
+	for overlap := maxOverlap; overlap > 0; overlap-- {
+		if strings.HasSuffix(previous, current[:overlap]) {
+			return current[overlap:]
+		}
+	}
+
+	return current
+}
+
+func buildImageResultsText(blocks []Block) string {
+	for _, block := range blocks {
+		if block.ImageModeBlock == nil || block.ImageModeBlock.Progress != "DONE" || len(block.ImageModeBlock.MediaItems) == 0 {
+			continue
+		}
+
+		var builder strings.Builder
+		imageModelList := make([]string, 0, len(block.ImageModeBlock.MediaItems))
+		for i, result := range block.ImageModeBlock.MediaItems {
+			builder.WriteString(utils.ImageShow(i, result.Name, result.Image))
+			imageModelList = append(imageModelList, result.Name)
+		}
+		if len(imageModelList) > 0 {
+			builder.WriteString("\n\n---\n")
+			builder.WriteString(strings.Join(imageModelList, ", "))
+		}
+		return builder.String()
+	}
+	return ""
+}
+
+func buildWebResultsText(blocks []Block) string {
+	for _, block := range blocks {
+		if block.WebResultBlock == nil || len(block.WebResultBlock.WebResults) == 0 {
+			continue
+		}
+
+		var builder strings.Builder
+		builder.WriteString("\n\n---\n")
+		for i, result := range block.WebResultBlock.WebResults {
+			builder.WriteString("\n\n")
+			builder.WriteString(utils.SearchShow(i, result.Name, result.URL, result.Snippet))
+		}
+		return builder.String()
+	}
+	return ""
 }
 
 // UploadURLResponse represents the response from the create_upload_url endpoint

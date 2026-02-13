@@ -60,6 +60,10 @@ func ChatCompletionsHandler(c *gin.Context) {
 		openSearch = true
 		model = strings.TrimSuffix(model, "-search")
 	}
+	// Support both "-think" and "-thinking" suffixes from clients.
+	if strings.HasSuffix(model, "-thinking") {
+		model = strings.TrimSuffix(model, "-thinking") + "-think"
+	}
 	model = config.ModelMapGet(model, model) // 获取模型名称
 	var prompt strings.Builder
 	img_data_list := []string{}
