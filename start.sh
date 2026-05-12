@@ -9,6 +9,9 @@ docker run -d \
   --env-file .env \
   ghcr.io/yushangxiao/pplx2api:latest
 
+# Make pplx reachable from the SkillBrain backend container by DNS name `pplx`.
+docker network connect skillbrain_bot_app-network pplx 2>/dev/null || true
+
 echo "Container started. Logs:"
 sleep 2
 docker logs pplx
