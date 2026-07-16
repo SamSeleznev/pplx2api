@@ -379,7 +379,12 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	}
 
 	if !stream {
-		return model.ReturnOpenAIResponse(fullText.String(), stream, responseModel, gc)
+		var cleanText strings.Builder
+		if lastReasoningText != "" {
+			cleanText.WriteString("<think>" + lastReasoningText + "</think>\n\n")
+		}
+		cleanText.WriteString(lastMarkdownText)
+		return model.ReturnOpenAIResponse(cleanText.String(), stream, responseModel, gc)
 	}
 
 	gc.Writer.Write([]byte("data: [DONE]\n\n"))
@@ -404,19 +409,23 @@ func extractReasoningText(blocks []Block) string {
 }
 
 func extractMarkdownText(blocks []Block) string {
-	var builder strings.Builder
+	bestText := ""
 	for _, block := range blocks {
 		if block.MarkdownBlock == nil || len(block.MarkdownBlock.Chunks) == 0 {
 			continue
 		}
+		var builder strings.Builder
 		for _, chunk := range block.MarkdownBlock.Chunks {
-			if chunk == "" {
-				continue
+			if chunk != "" {
+				builder.WriteString(chunk)
 			}
-			builder.WriteString(chunk)
+		}
+		text := builder.String()
+		if len(text) > len(bestText) {
+			bestText = text
 		}
 	}
-	return builder.String()
+	return bestText
 }
 
 func extractDelta(previous string, current string) string {
@@ -426,20 +435,52 @@ func extractDelta(previous string, current string) string {
 	if previous == "" {
 		return current
 	}
-	if strings.HasPrefix(current, previous) {
-		return current[len(previous):]
-	}
-	if strings.HasPrefix(previous, current) {
-		return ""
+
+	prevRunes := []rune(previous)
+	currRunes := []rune(current)
+
+	if len(currRunes) >= len(prevRunes) {
+		isPrefix := true
+		for i := 0; i < len(prevRunes); i++ {
+			if currRunes[i] != prevRunes[i] {
+				isPrefix = false
+				break
+			}
+		}
+		if isPrefix {
+			return string(currRunes[len(prevRunes):])
+		}
 	}
 
-	maxOverlap := len(previous)
-	if len(current) < maxOverlap {
-		maxOverlap = len(current)
+	if len(prevRunes) >= len(currRunes) {
+		isPrefix := true
+		for i := 0; i < len(currRunes); i++ {
+			if prevRunes[i] != currRunes[i] {
+				isPrefix = false
+				break
+			}
+		}
+		if isPrefix {
+			return ""
+		}
 	}
+
+	maxOverlap := len(prevRunes)
+	if len(currRunes) < maxOverlap {
+		maxOverlap = len(currRunes)
+	}
+
 	for overlap := maxOverlap; overlap > 0; overlap-- {
-		if strings.HasSuffix(previous, current[:overlap]) {
-			return current[overlap:]
+		match := true
+		prevStart := len(prevRunes) - overlap
+		for i := 0; i < overlap; i++ {
+			if prevRunes[prevStart+i] != currRunes[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return string(currRunes[overlap:])
 		}
 	}
 
